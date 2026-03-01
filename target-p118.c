@@ -315,7 +315,9 @@ static void p118_setup_test5(unsigned char *buff, int size, int offset, int payl
 
         //p118_setup_test5_hitcode(buff, i + ((0x00c0 - shift) & (bs - 1)), 0x0000);     // 0x03235C [0x0050B0] -> 0x50C0
         p118_setup_test5_hitcode(buff, i + ((0x0bf8 - shift) & (bs - 1)), 0x0000);     // 0x032274 -> 0x6BF8
-        //p118_setup_test5_hitcode(buff, i + ((0x0c50 - shift) & (bs - 1)), 0x0000);     // 0x006CFC -> 0x5C50   !!needs hitcode size max 0x58 to fit after 0x0bf8, partial cache of hex2uint64 with "download:0"!!
+        // Fix for XZ2 Premium: redirect 0x0c50 (overlaps 0x0bf8 hitcode) to 0x0c58 via short branch
+        OPCODE(buff + i + ((0x0c50 - shift) & (bs - 1)), 0x02, 0x00, 0x00, 0x14);  // b #0x08 (branch +8 bytes to 0x0c58)
+        p118_setup_test5_hitcode(buff, i + ((0x0c58 - shift) & (bs - 1)), 0x0000);     // 0x006CFC -> 0x5C50 (shifted +8 to avoid overlap)
         p118_setup_test5_hitcode(buff, i + ((0x0de4 - shift) & (bs - 1)), 0x0000);     // 0x006D48 -> 0x5DE4
         p118_setup_test5_hitcode(buff, i + ((0x0f30 - shift) & (bs - 1)), 0x0000);     // 0x032330 -> 0x1F30
         //OPCODE(buff + i + ((0x0f58 - shift) & (bs - 1)), 0xc0, 0x03, 0x5f, 0xd6);      // 0x0070D0 -> 0x6F88   ret = [ c0 03 5f d6 ]

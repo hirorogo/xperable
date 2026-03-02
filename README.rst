@@ -691,3 +691,46 @@ It is possible to connect two android phones via USB-C adapter (and a powered
 USB HUB) and run the exploit from a root shell on one phone in order to exploit
 the other phone - just use the ``aarch64`` cross compiled build of the tool.
 The root shell of the "host" phone may come from full root or even a temp root.
+
+
+SOV38 Helper Toolkit (日本語)
+-----------------------------
+
+このフォークには、AU版 Sony Xperia XZ2 Premium (SOV38 / aurora_kddi) 向けの
+ヘルパーツールキットが含まれています。
+
+**SOV38 Helper** は xperable のラッパースクリプトで、以下の機能を提供します:
+
+- TAパーティションの自動バックアップ
+- ブートローダーアンロック (BLU) のガイド付き実行
+- Magisk root化のステップバイステップガイド
+- デバイスステータス確認
+- エラーハンドリングと復旧ガイダンス
+
+使い方::
+
+    # インタラクティブメニュー
+    python3 sov38_helper.py
+
+    # 個別機能
+    python3 sov38_helper.py --check     # 環境チェック
+    python3 sov38_helper.py --status    # デバイス確認
+    python3 sov38_helper.py --backup    # TA + boot バックアップ
+    python3 sov38_helper.py --unlock    # BLアンロック
+    python3 sov38_helper.py --magisk    # Magisk root化
+
+必要なツール:
+
+- adb / fastboot (Android SDK Platform-Tools)
+- Python 3.8 以上
+- xperable バイナリ (``make`` でビルド)
+- USBドライバ (Windowsのみ)
+
+注意事項:
+
+- BLアンロック後は端末が初期化されます。必ず事前にバックアップを取ってください
+- TAパーティションのバックアップは **絶対に** 消さないでください
+- カメラDRM (Suntory/CKB) は不可逆的に消失します
+- Widevine は L1 → L3 に低下します
+
+詳細なガイド: https://hirorogo.github.io/Dev-dojo/docs/category/スマホ改造ガイド

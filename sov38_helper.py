@@ -30,13 +30,15 @@ import shutil
 import platform
 import time
 import argparse
+import json
+import re
 from pathlib import Path
 from datetime import datetime
 
 # ============================================================
 # 定数
 # ============================================================
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEVICE_NAME = "Sony Xperia XZ2 Premium (SOV38)"
 CODENAME = "aurora_kddi"
 SOC = "SDM845"  # Tama platform
@@ -48,6 +50,26 @@ BOOT_BACKUP_NAME = "boot_backup_{timestamp}.img"
 # Magisk 関連
 MAGISK_RELEASES_URL = "https://github.com/topjohnwu/Magisk/releases"
 MAGISK_APK_NAME = "Magisk-v28.1.apk"  # 最新版に適宜更新
+
+# エクスプロイト リトライ設定
+DEFAULT_MAX_RETRIES = 20           # バッファサイズ変更前のリトライ回数
+RETRY_DELAY_SEC = 3                # リトライ間の待機秒数
+EXPLOIT_TIMEOUT_SEC = 60           # 1回の実行タイムアウト
+
+# xperable -b オプション用バッファサイズ候補 (bytes)
+# SDM845 (Tama) で有効な範囲を網羅。デフォルト → 小さめ → 大きめ の順で試す
+BUFFER_SIZES = [
+    None,    # デフォルト (xperable内蔵値)
+    16384,   # 16KB
+    8192,    # 8KB
+    32768,   # 32KB
+    4096,    # 4KB
+    65536,   # 64KB
+    2048,    # 2KB
+    49152,   # 48KB
+    24576,   # 24KB
+    12288,   # 12KB
+]
 
 # カラー出力
 class Color:
@@ -373,6 +395,242 @@ def backup_boot_image():
 
 
 # ============================================================
+# エクスプロイト リトライエンジン
+# ============================================================
+def parse_xperable_output(stdout, stderr):
+    """xperableの出力を解析して成功/失敗/エラー種別を判定"""
+    combined = (stdout or "") + (stderr or "")
+    result = {
+        "success": False,
+        "connected": False,
+        "error_type": None,  # "usb", "overflow", "timeout", "unknown"
+        "raw": combined,
+    }
+
+    # 接続成功の判定
+    if "bootloader" in combined.lower() or "OKAY" in combined:
+        result["connected"] = True
+
+    # 成功パターン
+    if any(kw in combined for kw in ["OKAY", "unlock success", "patch applied"]):
+        result["success"] = True
+
+    # returncode 0 でエラーメッセージがなければ成功とみなす
+    # (xperable は成功時に特定のメッセージを出さない場合もある)
+
+    # エラーパターン判定
+    if "usb" in combined.lower() and ("error" in combined.lower() or "fail" in combined.lower()):
+        result["error_type"] = "usb"
+    elif "overflow" in combined.lower() or "buffer" in combined.lower():
+        result["error_type"] = "overflow"
+    elif "timeout" in combined.lower():
+        result["error_type"] = "timeout"
+    elif "FAIL" in combined or "error" in combined.lower():
+        result["error_type"] = "unknown"
+
+    return result
+
+
+def run_xperable_with_retry(xperable_bin, script_dir, xperable_args=None,
+                             max_retries=DEFAULT_MAX_RETRIES,
+                             auto_reconnect=True):
+    """
+    xperable をリトライ付きで実行する。
+
+    動作フロー:
+    1. デフォルトのバッファサイズで最大 max_retries 回試行
+    2. 全て失敗 → バッファサイズを変更して再度 max_retries 回ずつ試行
+    3. 各バッファサイズで試し、成功したサイズと回数を記録
+    4. 全サイズで失敗した場合は結果レポートを表示
+
+    Returns:
+        (success: bool, stats: dict)
+    """
+    if xperable_args is None:
+        xperable_args = ["-B", "-4"]
+
+    log_dir = get_backup_dir() / "exploit_logs"
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"exploit_log_{timestamp}.json"
+
+    stats = {
+        "start_time": datetime.now().isoformat(),
+        "total_attempts": 0,
+        "buffer_sizes_tried": [],
+        "success": False,
+        "success_buffer_size": None,
+        "success_attempt": None,
+        "attempts": [],
+    }
+
+    print_info(f"リトライモード: 最大 {max_retries}回/サイズ × {len(BUFFER_SIZES)}サイズ")
+    print_info(f"ログ保存先: {log_file}")
+    print()
+
+    for size_idx, buf_size in enumerate(BUFFER_SIZES):
+        size_label = f"{buf_size} bytes" if buf_size else "デフォルト"
+
+        if size_idx > 0:
+            print()
+            print_header(f"バッファサイズ変更: {size_label} ({size_idx + 1}/{len(BUFFER_SIZES)})")
+            print_info("USBケーブルを抜き差しして S1モード に再度入ってください")
+            print_info("  1. ケーブルを抜く")
+            print_info("  2. 10秒待つ")
+            print_info("  3. ボリュームDOWN + USB接続 → 緑LED")
+            wait_for_enter("S1モード（緑LED）になったら Enter...")
+
+        stats["buffer_sizes_tried"].append(size_label)
+
+        for attempt in range(1, max_retries + 1):
+            stats["total_attempts"] += 1
+            global_attempt = stats["total_attempts"]
+
+            # プログレスバー
+            bar_width = 30
+            filled = int(bar_width * attempt / max_retries)
+            bar = colored("█" * filled, Color.GREEN) + colored("░" * (bar_width - filled), Color.DIM)
+            print(f"\r  [{bar}] {colored(f'#{global_attempt}', Color.BOLD)} "
+                  f"サイズ={size_label} 試行 {attempt}/{max_retries}", end="", flush=True)
+
+            # xperable コマンド構築
+            cmd = [str(xperable_bin)]
+            if buf_size is not None:
+                cmd.extend(["-b", str(buf_size)])
+            cmd.extend(xperable_args)
+
+            attempt_info = {
+                "global_attempt": global_attempt,
+                "buffer_size": size_label,
+                "local_attempt": attempt,
+                "command": " ".join(cmd),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True,
+                    timeout=EXPLOIT_TIMEOUT_SEC,
+                    cwd=str(script_dir)
+                )
+
+                parsed = parse_xperable_output(result.stdout, result.stderr)
+                attempt_info["returncode"] = result.returncode
+                attempt_info["parsed"] = {
+                    "success": parsed["success"],
+                    "connected": parsed["connected"],
+                    "error_type": parsed["error_type"],
+                }
+                # 出力の最後の数行をログに保存
+                output_lines = parsed["raw"].strip().split("\n")
+                attempt_info["output_tail"] = output_lines[-5:] if output_lines else []
+
+                if result.returncode == 0:
+                    # 成功！
+                    print()  # 改行
+                    print_success(f"成功！ (試行 #{global_attempt}, サイズ={size_label})")
+
+                    stats["success"] = True
+                    stats["success_buffer_size"] = size_label
+                    stats["success_attempt"] = global_attempt
+                    attempt_info["result"] = "SUCCESS"
+                    stats["attempts"].append(attempt_info)
+
+                    # ログ保存
+                    stats["end_time"] = datetime.now().isoformat()
+                    _save_exploit_log(log_file, stats)
+
+                    return True, stats
+
+                else:
+                    attempt_info["result"] = "FAIL"
+                    error_hint = parsed["error_type"] or "unknown"
+                    print(f" → {colored('✗', Color.RED)} ({error_hint})", flush=True)
+
+            except subprocess.TimeoutExpired:
+                attempt_info["result"] = "TIMEOUT"
+                attempt_info["returncode"] = -1
+                print(f" → {colored('⏱ タイムアウト', Color.YELLOW)}", flush=True)
+
+            except Exception as e:
+                attempt_info["result"] = "ERROR"
+                attempt_info["error"] = str(e)
+                print(f" → {colored(f'✗ {e}', Color.RED)}", flush=True)
+
+            stats["attempts"].append(attempt_info)
+
+            # リトライ間のクールダウン
+            if attempt < max_retries:
+                # USB再接続が必要な場合
+                if auto_reconnect and attempt % 5 == 0:
+                    print()
+                    print_warn(f"5回連続失敗。USBを再接続してください")
+                    print_info("  ケーブルを抜く → 5秒待つ → ボリュームDOWN + USB接続")
+                    wait_for_enter("再接続したら Enter...")
+                else:
+                    time.sleep(RETRY_DELAY_SEC)
+
+        # このバッファサイズでは全滅
+        print()
+        print_warn(f"サイズ {size_label}: {max_retries}回全て失敗")
+
+    # 全バッファサイズで失敗
+    print()
+    stats["end_time"] = datetime.now().isoformat()
+    _save_exploit_log(log_file, stats)
+    _print_exploit_report(stats, log_file)
+
+    return False, stats
+
+
+def _save_exploit_log(log_file, stats):
+    """エクスプロイトログをJSONで保存"""
+    try:
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass  # ログ保存失敗は無視
+
+
+def _print_exploit_report(stats, log_file):
+    """エクスプロイト結果レポートを表示"""
+    print_header("エクスプロイト結果レポート")
+    print()
+    print_info(f"総試行回数: {stats['total_attempts']}")
+    print_info(f"試したバッファサイズ: {', '.join(stats['buffer_sizes_tried'])}")
+
+    if stats["success"]:
+        print_success(f"成功: 試行 #{stats['success_attempt']} "
+                      f"(サイズ: {stats['success_buffer_size']})")
+    else:
+        print_error("全て失敗しました")
+        print()
+        print_info("考えられる原因:")
+        print_info("  1. USBケーブル/ポートの相性が悪い → 別のケーブルやポートを試す")
+        print_info("  2. USB HUBを経由している → 直接接続する")
+        print_info("  3. OSのUSBドライバの問題 → 再起動して試す")
+        print_info("  4. デバイスのファームウェアバージョンが非対応")
+        print()
+
+        # エラー種別の集計
+        error_counts = {}
+        for a in stats["attempts"]:
+            result = a.get("result", "unknown")
+            parsed = a.get("parsed", {})
+            error_type = parsed.get("error_type", result)
+            error_counts[error_type] = error_counts.get(error_type, 0) + 1
+
+        if error_counts:
+            print_info("エラー内訳:")
+            for err_type, count in sorted(error_counts.items(), key=lambda x: -x[1]):
+                print_info(f"  {err_type}: {count}回")
+
+    print()
+    print_info(f"詳細ログ: {log_file}")
+
+
+# ============================================================
 # ブートローダーアンロック
 # ============================================================
 def bootloader_unlock():
@@ -425,38 +683,40 @@ def bootloader_unlock():
 
     wait_for_enter("S1モード（緑LED点灯）になったら Enter を押してください...")
 
-    # Step 2: xperable実行
+    # Step 2: xperable実行 (自動リトライ付き)
     print_step(2, "xperable を実行してBLアンロック")
-    print_info(f"実行: {xperable_bin} -4")
     print_info("TAパーティションの rooting_status を書き換えます...")
     print()
+
+    # リトライ設定の確認
+    print_info("エクスプロイトはUSBタイミングに依存するため、失敗は正常です。")
+    print_info(f"デフォルト: {DEFAULT_MAX_RETRIES}回リトライ → 失敗時にバッファサイズ変更")
+    print()
+
+    # カスタムリトライ回数の設定
+    custom_retries = input(colored(
+        f"  → リトライ回数 (Enter={DEFAULT_MAX_RETRIES}): ", Color.YELLOW
+    )).strip()
+    max_retries = int(custom_retries) if custom_retries.isdigit() else DEFAULT_MAX_RETRIES
 
     # バックアップディレクトリ作成
     backup_dir = get_backup_dir()
 
-    try:
-        # xperableは -4 オプションでBLアンロックパッチを実行
-        # -B でブートローダーバージョン確認、-4 でパッチ実行
-        result = subprocess.run(
-            [str(xperable_bin), "-B", "-4"],
-            timeout=120,
-            cwd=str(script_dir)
-        )
+    # リトライエンジンで実行
+    success, stats = run_xperable_with_retry(
+        xperable_bin, script_dir,
+        xperable_args=["-B", "-4"],
+        max_retries=max_retries,
+        auto_reconnect=True
+    )
 
-        if result.returncode != 0:
-            print_error("xperableの実行に失敗しました")
-            print_info("エラーを確認して再試行してください")
-            print_info("トラブルシューティング:")
-            print_info("  - USBケーブルを抜き差しして S1モード に再度入る")
-            print_info("  - 別のUSBポートを試す")
-            print_info("  - sudo で実行を試す (Linux/macOS)")
-            return False
-
-    except subprocess.TimeoutExpired:
-        print_error("タイムアウトしました。USBの接続を確認してください。")
-        return False
-    except Exception as e:
-        print_error(f"実行エラー: {e}")
+    if not success:
+        print_error("xperableの実行に失敗しました")
+        print_info("トラブルシューティング:")
+        print_info("  - 別のUSBケーブルを試す (短くて太いケーブルが良い)")
+        print_info("  - USB HUBを外して直接接続する")
+        print_info("  - sudo で実行を試す (Linux/macOS)")
+        print_info("  - PCを再起動してから再試行")
         return False
 
     print_success("xperable の実行が完了しました")
@@ -820,6 +1080,78 @@ def check_status():
 # ============================================================
 # メインメニュー
 # ============================================================
+def exploit_retry_standalone():
+    """エクスプロイトのリトライテスト (単体実行)"""
+    print_header("エクスプロイト リトライテスト")
+    print()
+    print_info("xperableエクスプロイトを自動リトライで実行します。")
+    print_info("BLアンロック以外のテスト (-0 や -2 など) にも使えます。")
+    print()
+
+    # xperableバイナリ確認
+    script_dir = Path(__file__).parent
+    xperable_bin = None
+    for name in ["xperable", "xperable.exe"]:
+        p = script_dir / name
+        if p.exists():
+            if not os.access(str(p), os.X_OK):
+                os.chmod(str(p), 0o755)
+            xperable_bin = p
+            break
+
+    if not xperable_bin:
+        print_error("xperable バイナリが見つかりません")
+        return
+
+    # テストケース選択
+    print_info("テストケース:")
+    print(f"  {colored('0', Color.CYAN)}) -0  基本クラッシュテスト")
+    print(f"  {colored('2', Color.CYAN)}) -2  バッファオフセット距離テスト")
+    print(f"  {colored('4', Color.CYAN)}) -4  BLアンロックパッチ (デフォルト)")
+    print(f"  {colored('5', Color.CYAN)}) -5  BLアンロックパッチ (代替)")
+    print(f"  {colored('c', Color.CYAN)}) カスタムオプション指定")
+    print()
+
+    choice = input(colored("  → 選択 (0/2/4/5/c) [4]: ", Color.YELLOW)).strip()
+
+    if choice == "0":
+        args = ["-0"]
+    elif choice == "2":
+        args = ["-2"]
+    elif choice == "5":
+        args = ["-B", "-5"]
+    elif choice == "c":
+        custom = input(colored("  → xperable オプション: ", Color.YELLOW)).strip()
+        args = custom.split()
+    else:
+        args = ["-B", "-4"]
+
+    # リトライ回数
+    retries_input = input(colored(
+        f"  → リトライ回数/サイズ [Enter={DEFAULT_MAX_RETRIES}]: ", Color.YELLOW
+    )).strip()
+    max_retries = int(retries_input) if retries_input.isdigit() else DEFAULT_MAX_RETRIES
+
+    print()
+    print_info("SOV38をS1モード（緑LED）にして接続してください")
+    wait_for_enter("準備できたら Enter...")
+
+    success, stats = run_xperable_with_retry(
+        xperable_bin, script_dir,
+        xperable_args=args,
+        max_retries=max_retries,
+        auto_reconnect=True
+    )
+
+    if success:
+        print_success("エクスプロイト成功！")
+        if stats.get("success_buffer_size"):
+            print_info(f"最適バッファサイズ: {stats['success_buffer_size']}")
+            print_info(f"成功までの試行回数: {stats['success_attempt']}")
+    else:
+        print_error("全試行が失敗しました。ログを確認してください。")
+
+
 def main_menu():
     """インタラクティブメニュー"""
     while True:
@@ -832,6 +1164,7 @@ def main_menu():
         print(f"  {colored('5', Color.CYAN)}) ブートローダーアンロック (BLU)")
         print(f"  {colored('6', Color.CYAN)}) Magisk root化")
         print(f"  {colored('7', Color.CYAN)}) フルガイド (1→5→6 を順番に実行)")
+        print(f"  {colored('8', Color.CYAN)}) エクスプロイト リトライテスト")
         print(f"  {colored('q', Color.RED)}) 終了")
         print()
 
@@ -851,6 +1184,8 @@ def main_menu():
             magisk_root()
         elif choice == "7":
             full_guide()
+        elif choice == "8":
+            exploit_retry_standalone()
         elif choice in ("q", "quit", "exit"):
             print_info("終了します")
             break

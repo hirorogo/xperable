@@ -32,13 +32,15 @@ import time
 import argparse
 import json
 import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 
 # ============================================================
 # 定数
 # ============================================================
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEVICE_NAME = "Sony Xperia XZ2 Premium (SOV38)"
 CODENAME = "aurora_kddi"
 SOC = "SDM845"  # Tama platform
@@ -50,6 +52,10 @@ BOOT_BACKUP_NAME = "boot_backup_{timestamp}.img"
 # Magisk 関連
 MAGISK_RELEASES_URL = "https://github.com/topjohnwu/Magisk/releases"
 MAGISK_APK_NAME = "Magisk-v28.1.apk"  # 最新版に適宜更新
+
+# GitHub Release（ビルド済みバイナリの自動ダウンロード用）
+GITHUB_RELEASE_URL = "https://github.com/hirorogo/xperable/releases/latest"
+GITHUB_API_RELEASES = "https://api.github.com/repos/hirorogo/xperable/releases/latest"
 
 # エクスプロイト リトライ設定
 DEFAULT_MAX_RETRIES = 20           # バッファサイズ変更前のリトライ回数
@@ -156,6 +162,82 @@ def cmd_exists(name):
 
 
 # ============================================================
+# xperable バイナリの自動ダウンロード
+# ============================================================
+def _detect_platform_asset():
+    """現在のOS/アーキテクチャに合うアセット名を返す"""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if system == "darwin" and machine in ("arm64", "aarch64"):
+        return "xperable-macos-arm64"
+    elif system == "darwin" and machine in ("x86_64", "amd64"):
+        return "xperable-macos-x86_64"
+    elif system == "linux" and machine in ("x86_64", "amd64"):
+        return "xperable"
+    elif system == "linux" and machine in ("aarch64", "arm64"):
+        return "xperable.aarch64"
+    elif system == "windows":
+        return "xperable.exe"
+    return None
+
+
+def download_xperable_binary(target_dir):
+    """
+    GitHub Releases からビルド済みバイナリをダウンロードする。
+    成功したらPathを返す。失敗したらNone。
+    """
+    asset_name = _detect_platform_asset()
+    if not asset_name:
+        print_warn(f"お使いの環境 ({platform.system()} {platform.machine()}) 用の"
+                   "ビルド済みバイナリはまだ提供されていません")
+        return None
+
+    print_info(f"GitHub Releases から {asset_name} をダウンロード中...")
+
+    try:
+        # GitHub APIでリリース情報を取得
+        req = urllib.request.Request(
+            GITHUB_API_RELEASES,
+            headers={"Accept": "application/vnd.github.v3+json",
+                     "User-Agent": "sov38-helper"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release_data = json.loads(resp.read().decode())
+
+        # アセットを探す
+        download_url = None
+        for asset in release_data.get("assets", []):
+            if asset["name"] == asset_name:
+                download_url = asset["browser_download_url"]
+                break
+
+        if not download_url:
+            print_warn(f"リリースに {asset_name} が見つかりません")
+            print_info(f"利用可能: {', '.join(a['name'] for a in release_data.get('assets', []))}")
+            return None
+
+        # ダウンロード
+        dest = Path(target_dir) / ("xperable.exe" if "exe" in asset_name else "xperable")
+        urllib.request.urlretrieve(download_url, str(dest))
+
+        # 実行権限を付与
+        if platform.system() != "Windows":
+            os.chmod(str(dest), 0o755)
+
+        size_kb = dest.stat().st_size / 1024
+        print_success(f"ダウンロード完了: {dest} ({size_kb:.0f} KB)")
+        return dest
+
+    except urllib.error.URLError as e:
+        print_error(f"ダウンロード失敗: ネットワークエラー ({e.reason})")
+        return None
+    except Exception as e:
+        print_error(f"ダウンロード失敗: {e}")
+        return None
+
+
+# ============================================================
 # 環境チェック
 # ============================================================
 def check_environment():
@@ -191,9 +273,17 @@ def check_environment():
         print_success(f"xperable: {xperable_bin}")
     else:
         print_warn("xperable バイナリが見つかりません")
-        print_info("先に make でビルドするか、リリースからダウンロードしてください")
-        print_info(f"  cd {script_dir} && make")
-        all_ok = False
+        print_info("自動ダウンロードを試みます...")
+        downloaded = download_xperable_binary(script_dir)
+        if downloaded:
+            xperable_bin = downloaded
+            print_success(f"xperable: {xperable_bin}")
+        else:
+            print_info("手動で入手する場合:")
+            print_info(f"  方法1: make でビルド → cd {script_dir} && make")
+            print_info(f"  方法2: GitHub Releases からダウンロード")
+            print_info(f"         {GITHUB_RELEASE_URL}")
+            all_ok = False
 
     # OS情報
     print_info(f"OS: {platform.system()} {platform.machine()}")
@@ -665,9 +755,14 @@ def bootloader_unlock():
             break
 
     if not xperable_bin:
-        print_error("xperable バイナリが見つかりません")
-        print_info("先にビルドしてください: make")
-        return False
+        print_warn("xperable バイナリが見つかりません。ダウンロードを試みます...")
+        downloaded = download_xperable_binary(script_dir)
+        if downloaded:
+            xperable_bin = downloaded
+        else:
+            print_error("xperable が見つかりません")
+            print_info(f"手動: make でビルド or {GITHUB_RELEASE_URL} からダウンロード")
+            return False
 
     # Step 1: S1モードへの誘導
     print_step(1, "SOV38をS1モード（緑LED）にする")
